@@ -1,0 +1,33 @@
+services:
+  rendezvous:
+    build:
+      # Build context is the workspace root so the Dockerfile can copy all
+      # Cargo workspace members needed for compilation.
+      context: ../..
+      dockerfile: rendezvous/docker/Dockerfile
+    restart: unless-stopped
+    expose:
+      - "8080"          # internal only; caddy proxies to this
+    environment:
+      - RUST_LOG=rendezvous=info
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/peers?username=healthcheck || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      rendezvous:
+        condition: service_healthy
+
+volumes:
+  caddy_data:

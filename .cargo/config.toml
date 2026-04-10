@@ -1,0 +1,11 @@
+[build]
+# Limit parallel link jobs to 1 on CI to avoid memory pressure.
+jobs = 1
+
+[target.x86_64-unknown-linux-gnu]
+# Use GNU ld (bfd) instead of rust-lld on Linux CI.
+# rust-lld (LLVM lld 21.x bundled with rust:latest) crashes with Bus error
+# (signal 7) on GitLab shared runners — likely a runner kernel/memory
+# incompatibility with this lld version. GNU ld is slower but stable.
+linker = "cc"
+rustflags = ["-C", "link-arg=-fuse-ld=bfd"]

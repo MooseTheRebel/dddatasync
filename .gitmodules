@@ -1,0 +1,3 @@
+[submodule "sendme"]
+	path = sendme
+	url = https://github.com/n0-computer/sendme.git

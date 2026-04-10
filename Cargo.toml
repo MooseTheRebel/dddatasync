@@ -1,0 +1,32 @@
+[workspace]
+members = [".", "rendezvous"]
+exclude = ["sendme"]   # read-only reference submodule; not part of the build
+resolver = "2"
+
+[package]
+name = "dddatasync"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4", features = ["derive"] }
+argon2 = "0.5"          # 0.6 is still RC; stay on stable
+dirs = "5"              # dirs 6 is a major bump; hold until tested
+iroh = "0.97"
+iroh-blobs = "0.99"
+n0-future = "0.3"
+notify = { version = "7", features = ["macos_fsevent"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.51", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = "1.8"
+
+[dev-dependencies]
+tempfile = "3.27"
+tokio = { version = "1.51", features = ["full"] }
+wiremock = "0.6"

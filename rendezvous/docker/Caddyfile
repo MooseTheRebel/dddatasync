@@ -1,0 +1,6 @@
+# Replace rendezvous.example.com with your actual domain before deploying.
+# Caddy will obtain and renew a TLS certificate automatically via Let's Encrypt.
+
+rendezvous.example.com {
+    reverse_proxy rendezvous:8080
+}
