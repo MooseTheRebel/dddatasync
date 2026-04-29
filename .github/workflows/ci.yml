@@ -93,6 +93,16 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --test test_watcher_subprocess -- --ignored --test-threads=1 --nocapture
 
+  rendezvous-py-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8.1.0
+      - run: uv python install 3.14
+        working-directory: rendezvous-py
+      - run: uv run pytest
+        working-directory: rendezvous-py
+
   # Layer 3 — Docker cross-network integration tests (Rust rendezvous server).
   # Uses docker:dind equivalent on GitHub Actions via the built-in Docker daemon.
   # Installs only the static docker CLI binary (not the full docker.io package).
