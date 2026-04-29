@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_HOME: ${{ github.workspace }}/.cargo
+  RUSTUP_HOME: ${{ github.workspace }}/.rustup
+  # Limit parallel link jobs to prevent OOM on small runners.
+  CARGO_BUILD_JOBS: "1"
+  # Disable incremental compilation to reduce disk usage (no .cargo/incremental/ bloat).
+  CARGO_INCREMENTAL: "0"
+  # Static docker CLI version pinned for reproducibility.
+  DOCKER_CLI_VERSION: "26.1.4"
+
+jobs:
+  deny-unsafe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cargo/registry/
+            .cargo/git/
+            target/
+          key: ${{ github.ref_name }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.ref_name }}-
+      - uses: dtolnay/rust-toolchain@stable
+      - run: RUSTFLAGS="-F unsafe-code" cargo build --workspace
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cargo/registry/
+            .cargo/git/
+            target/
+          key: ${{ github.ref_name }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.ref_name }}-
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p dddatasync --lib -- --test-threads=1
+
+  rendezvous-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cargo/registry/
+            .cargo/git/
+            target/
+          key: ${{ github.ref_name }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.ref_name }}-
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p rendezvous -- --test-threads=1
+
+  # Layer 2 — in-process watcher integration test (no Docker, needs iroh relay).
+  watcher-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cargo/registry/
+            .cargo/git/
+            target/
+          key: ${{ github.ref_name }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.ref_name }}-
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --test test_watcher -- --ignored --test-threads=1 --nocapture
+
+  # Layer 2.5 — subprocess watcher integration test (no Docker, needs compiled binaries + iroh relay).
+  watcher-subprocess-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cargo/registry/
+            .cargo/git/
+            target/
+          key: ${{ github.ref_name }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.ref_name }}-
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace
+      - run: cargo test --test test_watcher_subprocess -- --ignored --test-threads=1 --nocapture
+
+  # Layer 3 — Docker cross-network integration tests (Rust rendezvous server).
+  # Uses docker:dind equivalent on GitHub Actions via the built-in Docker daemon.
+  # Installs only the static docker CLI binary (not the full docker.io package).
+  docker-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cargo/registry/
+            .cargo/git/
+            target/
+          key: ${{ github.ref_name }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.ref_name }}-
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - name: Install dependencies
+        run: |
+          apt-get update -qq && apt-get install -y -qq musl-tools python3-pip
+          curl -fsSL \
+            https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz \
+            | tar -xz --strip-components=1 -C /usr/local/bin docker/docker
+          cargo install cargo-zigbuild
+          pip3 install ziglang --break-system-packages
+        env:
+          DOCKER_CLI_VERSION: ${{ env.DOCKER_CLI_VERSION }}
+      - run: cargo test --workspace --test test_dddatasync_on_same_network --test test_dddatasync_on_unique_networks -- --ignored --test-threads=1 --nocapture
+
+  # Layer 3 (Python variant) — same Docker integration tests against the Python
+  # rendezvous server. Builds the rendezvous-py image first, then injects it
+  # via RENDEZVOUS_IMAGE so the test harness uses it instead of the Rust binary.
+  docker-tests-py:
+    runs-on: ubuntu-latest
+    env:
+      RENDEZVOUS_IMAGE: rendezvous-py:latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cargo/registry/
+            .cargo/git/
+            target/
+          key: ${{ github.ref_name }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.ref_name }}-
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - name: Install dependencies
+        run: |
+          apt-get update -qq && apt-get install -y -qq musl-tools python3-pip
+          curl -fsSL \
+            https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz \
+            | tar -xz --strip-components=1 -C /usr/local/bin docker/docker
+          cargo install cargo-zigbuild
+          pip3 install ziglang --break-system-packages
+        env:
+          DOCKER_CLI_VERSION: ${{ env.DOCKER_CLI_VERSION }}
+      - run: docker build -t rendezvous-py:latest ./rendezvous-py/
+      - run: cargo test --workspace --test test_dddatasync_on_same_network --test test_dddatasync_on_unique_networks -- --ignored --test-threads=1 --nocapture
