@@ -3,9 +3,8 @@ use clap::{Parser, Subcommand};
 use iroh::{Endpoint, RelayMode};
 use tracing::info;
 
-
 use dddatasync::auth::UserIdentity;
-use dddatasync::rendezvous_client::rendezvous_url;
+use dddatasync::rendezvous_client::{rendezvous_url, RendezvousClient};
 use dddatasync::store::DddSync;
 use dddatasync::watcher::Watcher;
 
@@ -65,10 +64,25 @@ async fn cmd_login(username: &str, passphrase: &str) -> anyhow::Result<()> {
     let identity = UserIdentity::login(username, passphrase)
         .context("login failed")?;
 
-    // Login only derives and persists the identity — it does NOT register with
-    // the rendezvous server.  Registration happens when `dddatasync start` is
-    // run, ensuring the peer list only contains live, running nodes.
-    println!("logged in as {} (node_id: {})", identity.username, identity.node_id());
+    // Authenticate with the rendezvous server and persist the Bearer token.
+    let client = RendezvousClient::unauthenticated(rendezvous_url());
+    match client.server_login(username, passphrase).await {
+        Ok(token) => {
+            save_token(&token).context("save rendezvous token")?;
+            println!("logged in as {} (node_id: {})", identity.username, identity.node_id());
+        }
+        Err(e) => {
+            // Warn but don't abort — the user may be logging in without a server.
+            tracing::warn!(error = %e, "rendezvous server login failed; token not saved");
+            println!(
+                "local identity saved for {} (node_id: {}); \
+                 rendezvous server login failed: {}",
+                identity.username,
+                identity.node_id(),
+                e,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -95,9 +109,10 @@ async fn cmd_start() -> anyhow::Result<()> {
     tokio::spawn(listener.run());
 
     let url = rendezvous_url();
+    let token = load_token().unwrap_or_default();
     info!(rendezvous_url = %url, username = %identity.username, "starting watcher");
 
-    let watcher = Watcher::new(endpoint, store, identity, url);
+    let watcher = Watcher::new(endpoint, store, identity, url, token);
 
     // Shut down on Ctrl-C.
     let shutdown = async {
@@ -143,6 +158,40 @@ fn cmd_clean() -> anyhow::Result<()> {
         println!("removed {} stale .tmp-* file{}", removed, if removed == 1 { "" } else { "s" });
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Token persistence
+// ---------------------------------------------------------------------------
+
+fn token_path() -> anyhow::Result<std::path::PathBuf> {
+    let root = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
+        .join("dddatasync");
+    std::fs::create_dir_all(&root)?;
+    Ok(root.join(".token"))
+}
+
+fn save_token(token: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let path = token_path()?;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(token.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn load_token() -> anyhow::Result<String> {
+    let path = token_path()?;
+    let token = std::fs::read_to_string(&path)
+        .with_context(|| format!("read token file {:?} — run `dddatasync login` first", path))?;
+    Ok(token.trim().to_owned())
 }
 
 // ---------------------------------------------------------------------------

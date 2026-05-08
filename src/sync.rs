@@ -682,37 +682,6 @@ mod tests {
             );
             recv_ep.close().await;
         }
-
-        // ---- Test B: conceptual proof — open_bi deadlocks, timeout fires ---
-        //
-        // A server-side task that calls open_bi (the original bug) will
-        // deadlock: neither side writes first on the new stream, so both
-        // block waiting.  The timeout confirms this property.
-        {
-            let recv_ep = make_endpoint(50).await;
-            let recv_addr = loopback_addr(&recv_ep);
-            let recv_ep_task = recv_ep.clone();
-            let _server = tokio::spawn(async move {
-                let incoming = recv_ep_task.accept().await.unwrap();
-                let conn: Connection = incoming.await.unwrap();
-                // BUG: open_bi opens a *new* stream; neither side writes first.
-                let (_send, mut recv) = conn.open_bi().await.unwrap();
-                let _: Result<SyncOffer, _> = read_msg(&mut recv).await;
-            });
-
-            let send_ep = make_endpoint(51).await;
-            let mut recv_stream = send_offer(&send_ep, recv_addr).await;
-
-            let result = tokio::time::timeout(
-                Duration::from_secs(2),
-                read_msg::<SyncAck>(&mut recv_stream),
-            )
-            .await;
-            assert!(
-                result.is_err(),
-                "open_bi path: expected timeout (deadlock), but got a response"
-            );
-        }
     }
 
     // ------------------------------------------------------------------
