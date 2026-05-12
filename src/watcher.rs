@@ -63,12 +63,13 @@ impl Watcher {
         store: DddSync,
         identity: UserIdentity,
         rendezvous_url: impl Into<String>,
+        token: impl Into<String>,
     ) -> Self {
         Self {
             endpoint,
             store,
             identity,
-            rendezvous: RendezvousClient::new(rendezvous_url),
+            rendezvous: RendezvousClient::new(rendezvous_url, token),
         }
     }
 

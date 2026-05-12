@@ -204,7 +204,7 @@ async fn watcher_pushes_new_file_to_peer() {
 
     // Re-register node 1 with its actual live address so the mock returns it
     // to node 2 correctly (already handled above by peer_record_for_node1).
-    let _ = RendezvousClient::new(mock1.uri())
+    let _ = RendezvousClient::new(mock1.uri(), "test-token")
         .register(&RegisterRequest {
             username: identity1.username.clone(),
             node_id: node1_id,
@@ -215,7 +215,7 @@ async fn watcher_pushes_new_file_to_peer() {
 
     drop(node2_id); // only needed for peer_record construction above
 
-    let watcher1 = Watcher::new(ep1, store1, identity1, mock1.uri());
+    let watcher1 = Watcher::new(ep1, store1, identity1, mock1.uri(), "test-token");
 
     // -----------------------------------------------------------------------
     // Run the watcher in a background task; shut it down after the assertion.
