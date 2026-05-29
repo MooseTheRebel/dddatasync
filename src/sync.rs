@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{presets, Connection};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use iroh::SecretKey;
 use iroh_blobs::api::blobs::{AddPathOptions, ExportMode, ExportOptions, ImportMode};
@@ -166,7 +166,7 @@ pub async fn push(
     let fs_store = FsStore::load(&tmp_dir).await?;
 
     // --- Build the iroh router (serves blobs + our SYNC_ALPN) --------------
-    let endpoint = Endpoint::empty_builder()
+    let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .relay_mode(RelayMode::Default)
         .alpns(vec![iroh_blobs::ALPN.to_vec(), SYNC_ALPN.to_vec()])
@@ -253,7 +253,7 @@ pub async fn pull(
 
     let db = FsStore::load(&tmp_dir).await.context("open recv FsStore")?;
 
-    let endpoint = Endpoint::empty_builder()
+    let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .relay_mode(RelayMode::Default)
         .alpns(vec![iroh_blobs::ALPN.to_vec()])
@@ -262,7 +262,7 @@ pub async fn pull(
         .context("bind recv endpoint")?;
 
     // Connect to the sender's blob-serving endpoint.
-    let connection = tokio::time::timeout(
+    let connection: Connection = tokio::time::timeout(
         Duration::from_secs(30),
         endpoint.connect(sender_addr, iroh_blobs::ALPN),
     )
@@ -584,7 +584,7 @@ mod tests {
         // there is no relay overhead; bound_sockets() gives us the actual
         // UDP port immediately after bind() completes.
         async fn make_endpoint(seed: u8) -> Endpoint {
-            Endpoint::empty_builder()
+            Endpoint::builder(presets::N0)
                 .secret_key(test_key(seed))
                 .relay_mode(RelayMode::Disabled)
                 .alpns(vec![SYNC_ALPN.to_vec()])
@@ -702,7 +702,7 @@ mod tests {
         let src_file = write_test_file(sender_dir.path(), "sync_test.txt", content);
 
         // --- Receiver: set up a listener endpoint --------------------------
-        let recv_endpoint = Endpoint::empty_builder()
+        let recv_endpoint = Endpoint::builder(presets::N0)
             .secret_key(receiver_key.clone())
             .relay_mode(RelayMode::Default)
             .alpns(vec![SYNC_ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])
