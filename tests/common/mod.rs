@@ -461,26 +461,54 @@ pub fn rendezvous_signup_and_save_token(
     username: &str,
     password: &str,
 ) {
-    let http = reqwest::blocking::Client::new();
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("failed to build reqwest client");
+
+    // Wait until the rendezvous is reachable from the host via the published
+    // port.  The container-internal health check (docker_exec wget) can pass
+    // slightly before Docker's iptables rules are ready on the host side.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let ok = http
+            .get(&format!("{}/peers?username=healthcheck", rendezvous.host_url))
+            .send()
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if ok { break; }
+        assert!(
+            Instant::now() < deadline,
+            "rendezvous not reachable from host at {} after 15 s",
+            rendezvous.host_url
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 
     // Signup — ignore failures (e.g. 409 if the account already exists).
     let _ = http
         .post(&format!("{}/auth/signup", rendezvous.host_url))
-        .json(&serde_json::json!({
+        .header("Content-Type", "application/json")
+        .body(serde_json::json!({
             "username": username,
             "email": format!("{}@dddatasync.local", username),
             "password": password,
-        }))
+        }).to_string())
         .send();
 
-    // Login and extract the Bearer token.
-    let resp = http
+    // Login and extract the Bearer token.  Use .text() so the raw body is
+    // available in the error message if JSON parsing fails.
+    let body = http
         .post(&format!("{}/auth/login", rendezvous.host_url))
-        .json(&serde_json::json!({"username": username, "password": password}))
+        .header("Content-Type", "application/json")
+        .body(serde_json::json!({"username": username, "password": password}).to_string())
         .send()
         .unwrap_or_else(|e| panic!("POST /auth/login failed: {}", e))
-        .json::<serde_json::Value>()
-        .unwrap_or_else(|e| panic!("could not parse login response: {}", e));
+        .text()
+        .unwrap_or_else(|e| panic!("failed to read login response body: {}", e));
+
+    let resp: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("login response is not JSON: {} | body: {:?}", e, body));
 
     let token = resp["token"]
         .as_str()
