@@ -21,4 +21,4 @@ ENV DJANGO_SETTINGS_MODULE=rendezvous.settings
 EXPOSE 8080
 
 # PORT env var controls the listening port; defaults to 8080.
-CMD ["sh", "-c", "uv run python manage.py runserver 0.0.0.0:${PORT:-8080}"]
+CMD ["sh", "-c", "uv run python manage.py migrate --run-syncdb && uv run python manage.py runserver 0.0.0.0:${PORT:-8080}"]

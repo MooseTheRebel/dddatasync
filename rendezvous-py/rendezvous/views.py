@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import secrets
 
 from django.conf import settings
@@ -72,33 +73,41 @@ def signup_view(request: HttpRequest) -> JsonResponse:
     if UserAccount.objects.filter(email=email).exists():
         return JsonResponse({"error": "email already registered"}, status=409)
 
-    verification_token = secrets.token_hex(32)
+    auto_approve = os.environ.get("AUTO_APPROVE_USERS", "").lower() in ("true", "1")
+    if auto_approve:
+        status = AccountStatus.APPROVED
+        verification_token = ""
+    else:
+        status = AccountStatus.PENDING
+        verification_token = secrets.token_hex(32)
+
     account = UserAccount.objects.create(
         username=username,
         email=email,
         password_hash=make_password(password),
-        status=AccountStatus.PENDING,
+        status=status,
         verification_token=verification_token,
     )
 
-    verify_url = f"{settings.BASE_URL}/auth/verify/{verification_token}"
-    try:
-        send_mail(
-            subject="Verify your dddatasync account",
-            message=(
-                f"Hi {username},\n\n"
-                f"Please verify your email address by visiting:\n\n"
-                f"  {verify_url}\n\n"
-                f"If you did not create this account, you can ignore this email.\n"
-            ),
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[email],
-            fail_silently=False,
-        )
-    except Exception as exc:
-        logger.error("failed to send verification email to %s: %s", email, exc)
+    if not auto_approve:
+        verify_url = f"{settings.BASE_URL}/auth/verify/{verification_token}"
+        try:
+            send_mail(
+                subject="Verify your dddatasync account",
+                message=(
+                    f"Hi {username},\n\n"
+                    f"Please verify your email address by visiting:\n\n"
+                    f"  {verify_url}\n\n"
+                    f"If you did not create this account, you can ignore this email.\n"
+                ),
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+                fail_silently=False,
+            )
+        except Exception as exc:
+            logger.error("failed to send verification email to %s: %s", email, exc)
 
-    logger.info("signup username=%s email=%s", username, email)
+    logger.info("signup username=%s email=%s auto_approve=%s", username, email, auto_approve)
     return JsonResponse(
         {"message": "Account created. Please check your email to verify your address."},
         status=201,
