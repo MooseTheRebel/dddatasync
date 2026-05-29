@@ -19,7 +19,7 @@ use dddatasync::rendezvous_client::{PeerRecord, RendezvousClient, RegisterReques
 use dddatasync::store::DddSync;
 use dddatasync::sync::SyncListener;
 use dddatasync::watcher::Watcher;
-use iroh::{Endpoint, RelayMode, SecretKey};
+use iroh::{endpoint::presets, Endpoint, RelayMode, SecretKey};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -84,7 +84,7 @@ async fn watcher_pushes_new_file_to_peer() {
     // -----------------------------------------------------------------------
     // Bind iroh endpoints for both nodes.
     // -----------------------------------------------------------------------
-    let ep1 = Endpoint::empty_builder()
+    let ep1 = Endpoint::builder(presets::N0)
         .secret_key(key1.clone())
         .relay_mode(RelayMode::Default)
         .alpns(vec![dddatasync::sync::SYNC_ALPN.to_vec()])
@@ -92,7 +92,7 @@ async fn watcher_pushes_new_file_to_peer() {
         .await
         .unwrap();
 
-    let ep2 = Endpoint::empty_builder()
+    let ep2 = Endpoint::builder(presets::N0)
         .secret_key(key2.clone())
         .relay_mode(RelayMode::Default)
         .alpns(vec![dddatasync::sync::SYNC_ALPN.to_vec()])
