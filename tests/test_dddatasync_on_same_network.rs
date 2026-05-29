@@ -85,6 +85,17 @@ fn test_dddatasync_on_same_network() {
         common::docker_exec(name, &format!("mkdir -p {}", STORE_DIR));
     }
 
+    // Pre-create a rendezvous server account and inject the Bearer token into
+    // both containers.  POST /register requires auth; dddatasync login uses the
+    // device passphrase as the server password, which won't match, so the token
+    // must be in place before the watcher starts.
+    common::rendezvous_signup_and_save_token(
+        &_rendezvous.name,
+        &[&c1_name, &c2_name],
+        TEST_USERNAME,
+        TEST_PASSPHRASE,
+    );
+
     // -----------------------------------------------------------------------
     // Phase 2 — Login on both containers
     //
