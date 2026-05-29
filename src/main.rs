@@ -1,6 +1,6 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use iroh::{Endpoint, RelayMode};
+use iroh::{endpoint::presets, Endpoint, RelayMode};
 use tracing::info;
 
 use dddatasync::auth::UserIdentity;
@@ -92,7 +92,7 @@ async fn cmd_start() -> anyhow::Result<()> {
     )?;
     let store = DddSync::open().context("open store")?;
 
-    let endpoint = Endpoint::empty_builder()
+    let endpoint = Endpoint::builder(presets::N0)
         .secret_key(identity.secret_key().clone())
         .relay_mode(RelayMode::Default)
         .alpns(vec![dddatasync::sync::SYNC_ALPN.to_vec()])
