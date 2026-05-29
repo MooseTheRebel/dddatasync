@@ -119,7 +119,7 @@ fn test_dddatasync_on_unique_networks() {
     // device passphrase as the server password, which won't match, so the token
     // must be in place before the watcher starts.
     common::rendezvous_signup_and_save_token(
-        &_rendezvous.name,
+        &_rendezvous,
         &[&c1_name, &c2_name],
         TEST_USERNAME,
         TEST_PASSPHRASE,
