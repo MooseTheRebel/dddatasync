@@ -164,21 +164,31 @@ fn generate_token() -> String {
 // Bearer token authentication
 // ---------------------------------------------------------------------------
 
-async fn authenticate(headers: &HeaderMap, sessions: &SessionStore) -> Result<String, StatusCode> {
+async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<String, StatusCode> {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    let map = sessions.read().await;
-    let record = map.get(token).ok_or(StatusCode::UNAUTHORIZED)?;
+    let username = {
+        let map = state.sessions.read().await;
+        let record = map.get(token).ok_or(StatusCode::UNAUTHORIZED)?;
+        if record.expires_at < now_secs() {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        record.username.clone()
+    };
 
-    if record.expires_at < now_secs() {
-        return Err(StatusCode::UNAUTHORIZED);
+    // Reject tokens belonging to users who have since been blocked or whose
+    // account is still pending (e.g. tokens issued before an admin action).
+    let users = state.users.read().await;
+    let account = users.get(&username).ok_or(StatusCode::UNAUTHORIZED)?;
+    if account.status != AccountStatus::Approved {
+        return Err(StatusCode::FORBIDDEN);
     }
 
-    Ok(record.username.clone())
+    Ok(username)
 }
 
 // ---------------------------------------------------------------------------
@@ -214,22 +224,8 @@ async fn handle_signup(
         ));
     }
 
-    {
-        let users = state.users.read().await;
-        if users.contains_key(&username) {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "username already taken"})),
-            ));
-        }
-        if users.values().any(|u| u.email == email) {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "email already registered"})),
-            ));
-        }
-    }
-
+    // Hash password outside any lock — Argon2 is intentionally slow and must
+    // not block other operations while the write lock is held.
     let password_hash = hash_password(&password).map_err(|e| {
         warn!(error = %e, "hash_password failed");
         (
@@ -245,6 +241,33 @@ async fn handle_signup(
         (AccountStatus::Pending, Some(tok))
     };
 
+    // Check-and-insert atomically under the write lock to prevent TOCTOU.
+    {
+        let mut users = state.users.write().await;
+        if users.contains_key(&username) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "username already taken"})),
+            ));
+        }
+        if users.values().any(|u| u.email == email) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "email already registered"})),
+            ));
+        }
+        users.insert(
+            username.clone(),
+            UserAccount {
+                username: username.clone(),
+                email,
+                password_hash,
+                status,
+                verification_token: verification_token.clone(),
+            },
+        );
+    }
+
     if let Some(ref tok) = verification_token {
         state.verify_tokens.write().await.insert(tok.clone(), username.clone());
         // Log the verification URL so operators can share it when SMTP is not configured.
@@ -254,17 +277,6 @@ async fn handle_signup(
             "verification link (send this to the user or configure SMTP)"
         );
     }
-
-    state.users.write().await.insert(
-        username.clone(),
-        UserAccount {
-            username: username.clone(),
-            email,
-            password_hash,
-            status,
-            verification_token,
-        },
-    );
 
     info!(%username, auto_approve = auto_approve(), "signup");
 
@@ -297,9 +309,16 @@ async fn handle_verify(
 
     let mut users = state.users.write().await;
     if let Some(account) = users.get_mut(&username) {
-        account.status = AccountStatus::Approved;
-        account.verification_token = None;
-        info!(%username, "email verified");
+        if account.status == AccountStatus::Pending {
+            account.status = AccountStatus::Approved;
+            account.verification_token = None;
+            info!(%username, "email verified");
+        } else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "account is not pending verification"})),
+            ));
+        }
     }
 
     Ok(Json(serde_json::json!({"message": "Email verified. You can now log in."})))
@@ -365,7 +384,7 @@ async fn handle_register(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    authenticate(&headers, &state.sessions).await?;
+    authenticate(&headers, &state).await?;
 
     let req: RegisterRequest =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -409,7 +428,7 @@ async fn handle_deregister(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    authenticate(&headers, &state.sessions).await?;
+    authenticate(&headers, &state).await?;
 
     let req: DeregisterRequest =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -743,6 +762,103 @@ mod tests {
     // -----------------------------------------------------------------------
     // Prune
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Security fixes
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn blocked_user_token_is_rejected() {
+        std::env::set_var("AUTO_APPROVE_USERS", "true");
+        let state = make_state();
+        let server = TestServer::new(build_router(state.clone()));
+        let token = signup_and_login(&server, "blockeduser").await;
+
+        // Admin blocks the user after the token was already issued.
+        state.users.write().await.get_mut("blockeduser").unwrap().status = AccountStatus::Blocked;
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "username": "blockeduser", "node_id": "n1", "addrs": [], "relay_url": null
+        })).unwrap();
+        server
+            .post("/register")
+            .add_header("Authorization", format!("Bearer {token}"))
+            .bytes(body.into())
+            .content_type("application/json")
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn pending_user_token_cannot_register() {
+        // Tokens should never be issued to pending users (login blocks them),
+        // but if one were injected directly the middleware must still refuse it.
+        let state = make_state();
+        let server = TestServer::new(build_router(state.clone()));
+
+        state.users.write().await.insert(
+            "pendinguser".to_owned(),
+            UserAccount {
+                username: "pendinguser".to_owned(),
+                email: "pu@example.com".to_owned(),
+                password_hash: String::new(),
+                status: AccountStatus::Pending,
+                verification_token: None,
+            },
+        );
+        let injected_token = "injected-pending-token";
+        state.sessions.write().await.insert(
+            injected_token.to_owned(),
+            SessionRecord { username: "pendinguser".to_owned(), expires_at: now_secs() + 3600 },
+        );
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "username": "pendinguser", "node_id": "n1", "addrs": [], "relay_url": null
+        })).unwrap();
+        server
+            .post("/register")
+            .add_header("Authorization", format!("Bearer {injected_token}"))
+            .bytes(body.into())
+            .content_type("application/json")
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn verify_does_not_unblock_blocked_account() {
+        std::env::remove_var("AUTO_APPROVE_USERS");
+        let state = make_state();
+        let server = TestServer::new(build_router(state.clone()));
+
+        server
+            .post("/auth/signup")
+            .json(&serde_json::json!({
+                "username": "blockedverifier", "email": "bv@example.com", "password": "pw"
+            }))
+            .await
+            .assert_status(StatusCode::CREATED);
+
+        let tok = {
+            let vt = state.verify_tokens.read().await;
+            vt.keys().next().cloned().expect("verify token should exist")
+        };
+
+        // Admin blocks the user before they click the verification link.
+        state.users.write().await.get_mut("blockedverifier").unwrap().status =
+            AccountStatus::Blocked;
+
+        server
+            .get(&format!("/auth/verify/{tok}"))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+
+        assert_eq!(
+            state.users.read().await.get("blockedverifier").unwrap().status,
+            AccountStatus::Blocked,
+        );
+
+        std::env::set_var("AUTO_APPROVE_USERS", "true");
+    }
 
     #[tokio::test]
     async fn prune_removes_expired_entries() {

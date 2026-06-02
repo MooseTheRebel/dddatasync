@@ -30,7 +30,7 @@ def _authenticate(request: HttpRequest) -> "UserAccount | None":
     try:
         record = (
             SessionToken.objects.select_related("user")
-            .filter(token=token_str, expires_at__gt=now)
+            .filter(token=token_str, expires_at__gt=now, user__status=AccountStatus.APPROVED)
             .first()
         )
         return record.user if record else None

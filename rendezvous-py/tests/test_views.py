@@ -172,6 +172,77 @@ def test_expired_peer_is_excluded(client: Client) -> None:
     assert peers[0]["node_id"] == "e2"
 
 
+# ---------------------------------------------------------------------------
+# Security-fix tests
+# ---------------------------------------------------------------------------
+
+def test_blocked_user_token_is_rejected(client: Client, db) -> None:
+    """A token belonging to a blocked user must be rejected."""
+    user = UserAccount.objects.create(
+        username="blockeduser",
+        email="blocked@example.com",
+        password_hash=make_password("pw"),
+        status=AccountStatus.BLOCKED,
+    )
+    token_str = "blocked-user-token"
+    SessionToken.objects.create(
+        user=user,
+        token=token_str,
+        expires_at=timezone.now() + timedelta(hours=1),
+    )
+    body = json.dumps(
+        {"username": "blockeduser", "node_id": "n1", "addrs": [], "relay_url": None}
+    ).encode()
+    resp = client.post(
+        "/register",
+        data=body,
+        content_type="application/json",
+        HTTP_AUTHORIZATION=f"Bearer {token_str}",
+    )
+    assert resp.status_code == 401
+
+
+def test_pending_user_token_is_rejected(client: Client, db) -> None:
+    """A token belonging to a pending (unverified) user must be rejected."""
+    user = UserAccount.objects.create(
+        username="pendinguser",
+        email="pending@example.com",
+        password_hash=make_password("pw"),
+        status=AccountStatus.PENDING,
+    )
+    token_str = "pending-user-token"
+    SessionToken.objects.create(
+        user=user,
+        token=token_str,
+        expires_at=timezone.now() + timedelta(hours=1),
+    )
+    body = json.dumps(
+        {"username": "pendinguser", "node_id": "n1", "addrs": [], "relay_url": None}
+    ).encode()
+    resp = client.post(
+        "/register",
+        data=body,
+        content_type="application/json",
+        HTTP_AUTHORIZATION=f"Bearer {token_str}",
+    )
+    assert resp.status_code == 401
+
+
+def test_verify_does_not_unblock_blocked_account(client: Client, db) -> None:
+    """Email verification must not change the status of a blocked account."""
+    UserAccount.objects.create(
+        username="blockedverifier",
+        email="bv@example.com",
+        password_hash=make_password("pw"),
+        status=AccountStatus.BLOCKED,
+        verification_token="some-verify-token",
+    )
+    resp = client.get("/auth/verify/some-verify-token")
+    assert resp.status_code == 404
+    user = UserAccount.objects.get(username="blockedverifier")
+    assert user.status == AccountStatus.BLOCKED
+
+
 def test_prune_removes_expired_entries() -> None:
     with registry._lock:
         registry._registry["frank"] = [
