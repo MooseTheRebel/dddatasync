@@ -182,6 +182,8 @@ pub struct RendezvousContainer {
     #[allow(dead_code)]
     pub container: ContainerGuard,
     pub name: String,
+    /// `http://127.0.0.1:<port>` — the rendezvous API reachable from the host.
+    pub host_url: String,
 }
 
 impl RendezvousContainer {
@@ -202,6 +204,8 @@ impl RendezvousContainer {
             "run", "-d",
             "--name", &name,
             "--network", first_network,
+            "--env", "AUTO_APPROVE_USERS=true",
+            "--publish", "127.0.0.1::8080",
             ALPINE_IMAGE,
             "sleep", "300",
         ]);
@@ -211,6 +215,14 @@ impl RendezvousContainer {
             String::from_utf8_lossy(&out.stderr)
         );
         let guard = ContainerGuard::new(name.clone());
+
+        // Resolve the host-side port that Docker mapped to container:8080.
+        let port_out = docker(&["port", &name, "8080"]);
+        assert!(port_out.status.success(), "docker port {} 8080 failed", name);
+        let port_str = String::from_utf8_lossy(&port_out.stdout);
+        let host_port = port_str.trim().split(':').last()
+            .unwrap_or_else(|| panic!("could not parse host port from: {:?}", port_str));
+        let host_url = format!("http://127.0.0.1:{}", host_port);
 
         // Copy binary in.
         let src = binary.to_str().expect("non-UTF8 rendezvous path");
@@ -256,7 +268,7 @@ impl RendezvousContainer {
             std::thread::sleep(Duration::from_millis(200));
         }
 
-        RendezvousContainer { container: guard, name }
+        RendezvousContainer { container: guard, name, host_url }
     }
 
     /// Start a rendezvous container from a **pre-built Docker image** instead
@@ -279,6 +291,8 @@ impl RendezvousContainer {
             "run", "-d",
             "--name", &name,
             "--network", first_network,
+            "--env", "AUTO_APPROVE_USERS=true",
+            "--publish", "127.0.0.1::8080",
             image,
         ]);
         assert!(
@@ -288,6 +302,13 @@ impl RendezvousContainer {
             String::from_utf8_lossy(&out.stderr)
         );
         let guard = ContainerGuard::new(name.clone());
+
+        let port_out = docker(&["port", &name, "8080"]);
+        assert!(port_out.status.success(), "docker port {} 8080 failed", name);
+        let port_str = String::from_utf8_lossy(&port_out.stdout);
+        let host_port = port_str.trim().split(':').last()
+            .unwrap_or_else(|| panic!("could not parse host port from: {:?}", port_str));
+        let host_url = format!("http://127.0.0.1:{}", host_port);
 
         // Attach to extra networks.
         for net in extra_networks {
@@ -320,7 +341,7 @@ impl RendezvousContainer {
             std::thread::sleep(Duration::from_millis(200));
         }
 
-        RendezvousContainer { container: guard, name }
+        RendezvousContainer { container: guard, name, host_url }
     }
 }
 
@@ -420,4 +441,89 @@ pub fn read_file_in_container(container: &str, path: &str) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Sign up a test account on the rendezvous server, obtain a Bearer token,
+/// and write it to `/root/dddatasync/.token` in each of `token_containers`.
+///
+/// The rendezvous container must have been started with `AUTO_APPROVE_USERS=true`
+/// and with a host-published port (see `RendezvousContainer::start`).
+/// `POST /register` requires a valid Bearer token, so this must be called
+/// before `dddatasync start` runs.
+///
+/// `dddatasync login` is still run after this to set up the iroh identity.
+/// Its server-auth step will fail (device passphrase ≠ server password) and
+/// warn, but the failure path does not overwrite the token file — so the
+/// pre-injected token survives intact.
+pub fn rendezvous_signup_and_save_token(
+    rendezvous: &RendezvousContainer,
+    token_containers: &[&str],
+    username: &str,
+    password: &str,
+) {
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("failed to build reqwest client");
+
+    // Wait until the rendezvous is reachable from the host via the published
+    // port.  The container-internal health check (docker_exec wget) can pass
+    // slightly before Docker's iptables rules are ready on the host side.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let ok = http
+            .get(&format!("{}/peers?username=healthcheck", rendezvous.host_url))
+            .send()
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if ok { break; }
+        assert!(
+            Instant::now() < deadline,
+            "rendezvous not reachable from host at {} after 15 s",
+            rendezvous.host_url
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // Signup — ignore failures (e.g. 409 if the account already exists).
+    let _ = http
+        .post(&format!("{}/auth/signup", rendezvous.host_url))
+        .header("Content-Type", "application/json")
+        .body(serde_json::json!({
+            "username": username,
+            "email": format!("{}@dddatasync.local", username),
+            "password": password,
+        }).to_string())
+        .send();
+
+    // Login and extract the Bearer token.  Use .text() so the raw body is
+    // available in the error message if JSON parsing fails.
+    let body = http
+        .post(&format!("{}/auth/login", rendezvous.host_url))
+        .header("Content-Type", "application/json")
+        .body(serde_json::json!({"username": username, "password": password}).to_string())
+        .send()
+        .unwrap_or_else(|e| panic!("POST /auth/login failed: {}", e))
+        .text()
+        .unwrap_or_else(|e| panic!("failed to read login response body: {}", e));
+
+    let resp: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("login response is not JSON: {} | body: {:?}", e, body));
+
+    let token = resp["token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no token in login response: {:?}", resp));
+
+    // Inject the token file into each dddatasync container.
+    for &container in token_containers {
+        docker_exec(
+            container,
+            &format!(
+                "mkdir -p /root/dddatasync && \
+                 printf '%s' '{}' > /root/dddatasync/.token && \
+                 chmod 600 /root/dddatasync/.token",
+                token
+            ),
+        );
+    }
 }

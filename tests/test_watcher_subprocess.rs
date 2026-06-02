@@ -144,6 +144,7 @@ fn watcher_subprocess_syncs_file_between_two_nodes() {
 
     let rdv_proc = Command::new(&rdv_bin)
         .env("PORT", rdv_port.to_string())
+        .env("AUTO_APPROVE_USERS", "true")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -178,6 +179,46 @@ fn watcher_subprocess_syncs_file_between_two_nodes() {
     // -----------------------------------------------------------------------
     let username = "subprocess-testuser";
     let passphrases = ["subprocess-hunter2-device1", "subprocess-hunter2-device2"];
+
+    // Pre-create a rendezvous server account and inject the Bearer token into
+    // both home directories.  POST /register requires auth; the device
+    // passphrases differ from the shared server password, so server_login in
+    // dddatasync login will fail silently without overwriting the token file.
+    {
+        let server_password = "subprocess-server-pw";
+        let http = reqwest::blocking::Client::new();
+
+        http.post(&format!("{}/auth/signup", rdv_url))
+            .json(&serde_json::json!({
+                "username": username,
+                "email": format!("{}@dddatasync.local", username),
+                "password": server_password,
+            }))
+            .send()
+            .expect("POST /auth/signup failed");
+
+        let resp = http
+            .post(&format!("{}/auth/login", rdv_url))
+            .json(&serde_json::json!({"username": username, "password": server_password}))
+            .send()
+            .expect("POST /auth/login failed")
+            .json::<serde_json::Value>()
+            .expect("failed to parse login response");
+        let token = resp["token"].as_str().expect("no token in login response");
+
+        for home in [home1.path(), home2.path()] {
+            let token_path = home.join("dddatasync").join(".token");
+            std::fs::write(&token_path, token).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    &token_path,
+                    std::fs::Permissions::from_mode(0o600),
+                ).unwrap();
+            }
+        }
+    }
 
     for (home, passphrase) in [home1.path(), home2.path()].iter().zip(passphrases.iter()) {
         let out = Command::new(&ddd_bin)

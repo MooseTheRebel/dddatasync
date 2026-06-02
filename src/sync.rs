@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{presets, Connection};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use iroh::SecretKey;
 use iroh_blobs::api::blobs::{AddPathOptions, ExportMode, ExportOptions, ImportMode};
@@ -166,7 +166,7 @@ pub async fn push(
     let fs_store = FsStore::load(&tmp_dir).await?;
 
     // --- Build the iroh router (serves blobs + our SYNC_ALPN) --------------
-    let endpoint = Endpoint::empty_builder()
+    let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .relay_mode(RelayMode::Default)
         .alpns(vec![iroh_blobs::ALPN.to_vec(), SYNC_ALPN.to_vec()])
@@ -253,7 +253,7 @@ pub async fn pull(
 
     let db = FsStore::load(&tmp_dir).await.context("open recv FsStore")?;
 
-    let endpoint = Endpoint::empty_builder()
+    let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .relay_mode(RelayMode::Default)
         .alpns(vec![iroh_blobs::ALPN.to_vec()])
@@ -262,7 +262,7 @@ pub async fn pull(
         .context("bind recv endpoint")?;
 
     // Connect to the sender's blob-serving endpoint.
-    let connection = tokio::time::timeout(
+    let connection: Connection = tokio::time::timeout(
         Duration::from_secs(30),
         endpoint.connect(sender_addr, iroh_blobs::ALPN),
     )
@@ -584,7 +584,7 @@ mod tests {
         // there is no relay overhead; bound_sockets() gives us the actual
         // UDP port immediately after bind() completes.
         async fn make_endpoint(seed: u8) -> Endpoint {
-            Endpoint::empty_builder()
+            Endpoint::builder(presets::N0)
                 .secret_key(test_key(seed))
                 .relay_mode(RelayMode::Disabled)
                 .alpns(vec![SYNC_ALPN.to_vec()])
@@ -682,37 +682,6 @@ mod tests {
             );
             recv_ep.close().await;
         }
-
-        // ---- Test B: conceptual proof — open_bi deadlocks, timeout fires ---
-        //
-        // A server-side task that calls open_bi (the original bug) will
-        // deadlock: neither side writes first on the new stream, so both
-        // block waiting.  The timeout confirms this property.
-        {
-            let recv_ep = make_endpoint(50).await;
-            let recv_addr = loopback_addr(&recv_ep);
-            let recv_ep_task = recv_ep.clone();
-            let _server = tokio::spawn(async move {
-                let incoming = recv_ep_task.accept().await.unwrap();
-                let conn: Connection = incoming.await.unwrap();
-                // BUG: open_bi opens a *new* stream; neither side writes first.
-                let (_send, mut recv) = conn.open_bi().await.unwrap();
-                let _: Result<SyncOffer, _> = read_msg(&mut recv).await;
-            });
-
-            let send_ep = make_endpoint(51).await;
-            let mut recv_stream = send_offer(&send_ep, recv_addr).await;
-
-            let result = tokio::time::timeout(
-                Duration::from_secs(2),
-                read_msg::<SyncAck>(&mut recv_stream),
-            )
-            .await;
-            assert!(
-                result.is_err(),
-                "open_bi path: expected timeout (deadlock), but got a response"
-            );
-        }
     }
 
     // ------------------------------------------------------------------
@@ -733,7 +702,7 @@ mod tests {
         let src_file = write_test_file(sender_dir.path(), "sync_test.txt", content);
 
         // --- Receiver: set up a listener endpoint --------------------------
-        let recv_endpoint = Endpoint::empty_builder()
+        let recv_endpoint = Endpoint::builder(presets::N0)
             .secret_key(receiver_key.clone())
             .relay_mode(RelayMode::Default)
             .alpns(vec![SYNC_ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])

@@ -19,7 +19,7 @@ use dddatasync::rendezvous_client::{PeerRecord, RendezvousClient, RegisterReques
 use dddatasync::store::DddSync;
 use dddatasync::sync::SyncListener;
 use dddatasync::watcher::Watcher;
-use iroh::{Endpoint, RelayMode, SecretKey};
+use iroh::{endpoint::presets, Endpoint, RelayMode, SecretKey};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -84,7 +84,7 @@ async fn watcher_pushes_new_file_to_peer() {
     // -----------------------------------------------------------------------
     // Bind iroh endpoints for both nodes.
     // -----------------------------------------------------------------------
-    let ep1 = Endpoint::empty_builder()
+    let ep1 = Endpoint::builder(presets::N0)
         .secret_key(key1.clone())
         .relay_mode(RelayMode::Default)
         .alpns(vec![dddatasync::sync::SYNC_ALPN.to_vec()])
@@ -92,7 +92,7 @@ async fn watcher_pushes_new_file_to_peer() {
         .await
         .unwrap();
 
-    let ep2 = Endpoint::empty_builder()
+    let ep2 = Endpoint::builder(presets::N0)
         .secret_key(key2.clone())
         .relay_mode(RelayMode::Default)
         .alpns(vec![dddatasync::sync::SYNC_ALPN.to_vec()])
@@ -204,7 +204,7 @@ async fn watcher_pushes_new_file_to_peer() {
 
     // Re-register node 1 with its actual live address so the mock returns it
     // to node 2 correctly (already handled above by peer_record_for_node1).
-    let _ = RendezvousClient::new(mock1.uri())
+    let _ = RendezvousClient::new(mock1.uri(), "test-token")
         .register(&RegisterRequest {
             username: identity1.username.clone(),
             node_id: node1_id,
@@ -215,7 +215,7 @@ async fn watcher_pushes_new_file_to_peer() {
 
     drop(node2_id); // only needed for peer_record construction above
 
-    let watcher1 = Watcher::new(ep1, store1, identity1, mock1.uri());
+    let watcher1 = Watcher::new(ep1, store1, identity1, mock1.uri(), "test-token");
 
     // -----------------------------------------------------------------------
     // Run the watcher in a background task; shut it down after the assertion.

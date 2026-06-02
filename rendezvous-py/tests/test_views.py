@@ -10,14 +10,41 @@ Mirrors the coverage of the Rust server test suite:
   - DELETE of unknown peer is a silent no-op
   - TTL: expired records are excluded from GET /peers
   - prune: registry.prune() removes expired entries
+  - auth: unauthenticated POST/DELETE return 401
 """
 
 import json
 import time
+from datetime import timedelta
 
+import pytest
+from django.contrib.auth.hashers import make_password
 from django.test import Client
+from django.utils import timezone
 
 from rendezvous import registry
+from rendezvous.models import AccountStatus, SessionToken, UserAccount
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def bearer_token(db):
+    """Create an approved user and return a valid Bearer token string."""
+    user = UserAccount.objects.create(
+        username="testuser",
+        email="testuser@example.com",
+        password_hash=make_password("pw"),
+        status=AccountStatus.APPROVED,
+    )
+    token_str = "test-bearer-token-abc123"
+    SessionToken.objects.create(
+        user=user,
+        token=token_str,
+        expires_at=timezone.now() + timedelta(hours=1),
+    )
+    return token_str
 
 
 # ---------------------------------------------------------------------------
@@ -30,13 +57,17 @@ def _register(
     node_id: str,
     addrs: list[str] | None = None,
     relay_url: str | None = None,
+    *,
+    token: str,
 ) -> None:
+    body = json.dumps(
+        {"username": username, "node_id": node_id, "addrs": addrs or [], "relay_url": relay_url}
+    ).encode()
     resp = client.post(
         "/register",
-        data=json.dumps(
-            {"username": username, "node_id": node_id, "addrs": addrs or [], "relay_url": relay_url}
-        ),
+        data=body,
         content_type="application/json",
+        HTTP_AUTHORIZATION=f"Bearer {token}",
     )
     assert resp.status_code == 200
 
@@ -47,17 +78,35 @@ def _peers(client: Client, username: str) -> list[dict]:
     return json.loads(resp.content)["peers"]
 
 
-def _deregister(client: Client, username: str, node_id: str) -> int:
+def _deregister(client: Client, username: str, node_id: str, *, token: str) -> int:
+    body = json.dumps({"username": username, "node_id": node_id}).encode()
     resp = client.delete(
         "/register",
-        data=json.dumps({"username": username, "node_id": node_id}),
+        data=body,
         content_type="application/json",
+        HTTP_AUTHORIZATION=f"Bearer {token}",
     )
     return resp.status_code
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Auth tests
+# ---------------------------------------------------------------------------
+
+def test_register_without_auth_returns_401(client: Client) -> None:
+    body = json.dumps({"username": "alice", "node_id": "n1", "addrs": [], "relay_url": None})
+    resp = client.post("/register", data=body, content_type="application/json")
+    assert resp.status_code == 401
+
+
+def test_deregister_without_auth_returns_401(client: Client) -> None:
+    body = json.dumps({"username": "alice", "node_id": "n1"})
+    resp = client.delete("/register", data=body, content_type="application/json")
+    assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Functional tests
 # ---------------------------------------------------------------------------
 
 def test_health_check_returns_200_empty_list(client: Client) -> None:
@@ -66,9 +115,9 @@ def test_health_check_returns_200_empty_list(client: Client) -> None:
     assert json.loads(resp.content) == {"peers": []}
 
 
-def test_register_and_fetch_peer(client: Client) -> None:
-    _register(client, "alice", "node-abc", ["1.2.3.4:1234"], "https://relay.example.com")
-    peers = _peers(client, "alice")
+def test_register_and_fetch_peer(client: Client, bearer_token: str) -> None:
+    _register(client, "testuser", "node-abc", ["1.2.3.4:1234"], "https://relay.example.com", token=bearer_token)
+    peers = _peers(client, "testuser")
     assert len(peers) == 1
     assert peers[0]["node_id"] == "node-abc"
     assert peers[0]["addrs"] == ["1.2.3.4:1234"]
@@ -76,40 +125,53 @@ def test_register_and_fetch_peer(client: Client) -> None:
     assert isinstance(peers[0]["last_seen"], int)
 
 
-def test_register_upserts_existing_node(client: Client) -> None:
-    _register(client, "bob", "node-bob", ["10.0.0.1:9000"])
-    _register(client, "bob", "node-bob", ["10.0.0.2:9001"], "https://relay.example.com")
-    peers = _peers(client, "bob")
+def test_register_upserts_existing_node(client: Client, bearer_token: str) -> None:
+    _register(client, "testuser", "node-tu", ["10.0.0.1:9000"], token=bearer_token)
+    _register(client, "testuser", "node-tu", ["10.0.0.2:9001"], "https://relay.example.com", token=bearer_token)
+    peers = _peers(client, "testuser")
     assert len(peers) == 1, "re-registration must upsert, not duplicate"
     assert peers[0]["addrs"] == ["10.0.0.2:9001"]
     assert peers[0]["relay_url"] == "https://relay.example.com"
 
 
-def test_multiple_devices_returned_for_same_user(client: Client) -> None:
-    _register(client, "carol", "node-1", ["1.0.0.1:1"])
-    _register(client, "carol", "node-2", ["2.0.0.2:2"])
-    assert len(_peers(client, "carol")) == 2
+def test_multiple_devices_returned_for_same_user(client: Client, bearer_token: str) -> None:
+    _register(client, "testuser", "node-1", ["1.0.0.1:1"], token=bearer_token)
+    _register(client, "testuser", "node-2", ["2.0.0.2:2"], token=bearer_token)
+    assert len(_peers(client, "testuser")) == 2
 
 
-def test_users_are_isolated(client: Client) -> None:
-    _register(client, "alice", "a1")
-    _register(client, "bob", "b1")
-    peers = _peers(client, "alice")
+def test_users_are_isolated(client: Client, bearer_token: str, db) -> None:
+    # Create a second user with their own token.
+    user2 = UserAccount.objects.create(
+        username="testuser2",
+        email="testuser2@example.com",
+        password_hash=make_password("pw"),
+        status=AccountStatus.APPROVED,
+    )
+    token2 = "test-bearer-token-user2"
+    SessionToken.objects.create(
+        user=user2,
+        token=token2,
+        expires_at=timezone.now() + timedelta(hours=1),
+    )
+    _register(client, "testuser", "a1", token=bearer_token)
+    _register(client, "testuser2", "b1", token=token2)
+    peers = _peers(client, "testuser")
     assert len(peers) == 1
     assert peers[0]["node_id"] == "a1"
 
 
-def test_deregister_removes_peer(client: Client) -> None:
-    _register(client, "dave", "d1")
-    _register(client, "dave", "d2")
-    assert _deregister(client, "dave", "d1") == 200
-    peers = _peers(client, "dave")
+def test_deregister_removes_peer(client: Client, bearer_token: str) -> None:
+    _register(client, "testuser", "d1", token=bearer_token)
+    _register(client, "testuser", "d2", token=bearer_token)
+    assert _deregister(client, "testuser", "d1", token=bearer_token) == 200
+    peers = _peers(client, "testuser")
     assert len(peers) == 1
     assert peers[0]["node_id"] == "d2"
 
 
-def test_deregister_nonexistent_is_noop(client: Client) -> None:
-    assert _deregister(client, "nobody", "ghost") == 200
+def test_deregister_nonexistent_is_noop(client: Client, bearer_token: str) -> None:
+    assert _deregister(client, "testuser", "ghost", token=bearer_token) == 200
 
 
 def test_expired_peer_is_excluded(client: Client) -> None:
@@ -121,6 +183,133 @@ def test_expired_peer_is_excluded(client: Client) -> None:
     peers = _peers(client, "eve")
     assert len(peers) == 1, "only the live record should be returned"
     assert peers[0]["node_id"] == "e2"
+
+
+# ---------------------------------------------------------------------------
+# Security-fix tests
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# BOLA: authenticated user cannot act on behalf of a different user
+# ---------------------------------------------------------------------------
+
+def test_register_for_different_user_is_forbidden(client: Client, bearer_token: str, db) -> None:
+    """Authenticated user may not register peers under another username."""
+    other_user = UserAccount.objects.create(
+        username="other",
+        email="other@example.com",
+        password_hash=make_password("pw"),
+        status=AccountStatus.APPROVED,
+    )
+    body = json.dumps(
+        {"username": other_user.username, "node_id": "n1", "addrs": [], "relay_url": None}
+    ).encode()
+    resp = client.post(
+        "/register",
+        data=body,
+        content_type="application/json",
+        HTTP_AUTHORIZATION=f"Bearer {bearer_token}",
+    )
+    assert resp.status_code == 403
+
+
+def test_deregister_for_different_user_is_forbidden(client: Client, bearer_token: str, db) -> None:
+    """Authenticated user may not deregister peers belonging to another username."""
+    other_user = UserAccount.objects.create(
+        username="other2",
+        email="other2@example.com",
+        password_hash=make_password("pw"),
+        status=AccountStatus.APPROVED,
+    )
+    body = json.dumps({"username": other_user.username, "node_id": "n1"}).encode()
+    resp = client.delete(
+        "/register",
+        data=body,
+        content_type="application/json",
+        HTTP_AUTHORIZATION=f"Bearer {bearer_token}",
+    )
+    assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Timing: login for unknown username still runs full password check
+# ---------------------------------------------------------------------------
+
+def test_login_nonexistent_user_returns_401(client: Client, db) -> None:
+    """Unknown usernames must return 401, not crash, and must run check_password."""
+    resp = client.post(
+        "/auth/login",
+        data=json.dumps({"username": "ghost", "password": "x"}).encode(),
+        content_type="application/json",
+    )
+    assert resp.status_code == 401
+
+
+def test_blocked_user_token_is_rejected(client: Client, db) -> None:
+    """A token belonging to a blocked user must be rejected."""
+    user = UserAccount.objects.create(
+        username="blockeduser",
+        email="blocked@example.com",
+        password_hash=make_password("pw"),
+        status=AccountStatus.BLOCKED,
+    )
+    token_str = "blocked-user-token"
+    SessionToken.objects.create(
+        user=user,
+        token=token_str,
+        expires_at=timezone.now() + timedelta(hours=1),
+    )
+    body = json.dumps(
+        {"username": "blockeduser", "node_id": "n1", "addrs": [], "relay_url": None}
+    ).encode()
+    resp = client.post(
+        "/register",
+        data=body,
+        content_type="application/json",
+        HTTP_AUTHORIZATION=f"Bearer {token_str}",
+    )
+    assert resp.status_code == 401
+
+
+def test_pending_user_token_is_rejected(client: Client, db) -> None:
+    """A token belonging to a pending (unverified) user must be rejected."""
+    user = UserAccount.objects.create(
+        username="pendinguser",
+        email="pending@example.com",
+        password_hash=make_password("pw"),
+        status=AccountStatus.PENDING,
+    )
+    token_str = "pending-user-token"
+    SessionToken.objects.create(
+        user=user,
+        token=token_str,
+        expires_at=timezone.now() + timedelta(hours=1),
+    )
+    body = json.dumps(
+        {"username": "pendinguser", "node_id": "n1", "addrs": [], "relay_url": None}
+    ).encode()
+    resp = client.post(
+        "/register",
+        data=body,
+        content_type="application/json",
+        HTTP_AUTHORIZATION=f"Bearer {token_str}",
+    )
+    assert resp.status_code == 401
+
+
+def test_verify_does_not_unblock_blocked_account(client: Client, db) -> None:
+    """Email verification must not change the status of a blocked account."""
+    UserAccount.objects.create(
+        username="blockedverifier",
+        email="bv@example.com",
+        password_hash=make_password("pw"),
+        status=AccountStatus.BLOCKED,
+        verification_token="some-verify-token",
+    )
+    resp = client.get("/auth/verify/some-verify-token")
+    assert resp.status_code == 404
+    user = UserAccount.objects.get(username="blockedverifier")
+    assert user.status == AccountStatus.BLOCKED
 
 
 def test_prune_removes_expired_entries() -> None:

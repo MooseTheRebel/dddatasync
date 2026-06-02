@@ -13,6 +13,10 @@ env:
   CARGO_INCREMENTAL: "0"
   # Static docker CLI version pinned for reproducibility.
   DOCKER_CLI_VERSION: "26.1.4"
+  # iroh Services API key — needed for relay connectivity in integration tests.
+  # Set this secret in GitHub repo settings (Settings → Secrets → Actions).
+  # Locally, put it in .secrets (gitignored) and run via `just act-test`.
+  IROH_SERVICES_API_SECRET: ${{ secrets.IROH_SERVICES_API_SECRET }}
 
 jobs:
   deny-unsafe:
