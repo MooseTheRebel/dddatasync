@@ -15,6 +15,11 @@ from rendezvous.models import AccountStatus, SessionToken, UserAccount
 
 logger = logging.getLogger(__name__)
 
+# Pre-computed hash used when a login username is not found, so that
+# check_password always runs its full PBKDF2 iteration and prevents
+# username enumeration via response-time differences.
+_DUMMY_HASH = make_password("_dummy_")
+
 
 # ---------------------------------------------------------------------------
 # Auth helpers
@@ -145,20 +150,27 @@ def login_view(request: HttpRequest) -> JsonResponse:
 
     try:
         account = UserAccount.objects.get(username=username)
+        password_hash = account.password_hash
+        account_status = account.status
     except UserAccount.DoesNotExist:
+        # Use the dummy hash so check_password always runs its full PBKDF2
+        # iteration, preventing username enumeration via timing differences.
+        password_hash = _DUMMY_HASH
+        account_status = None
+
+    password_ok = check_password(password, password_hash)
+
+    if not password_ok or account_status is None:
         return JsonResponse({"error": "invalid credentials"}, status=401)
 
-    if not check_password(password, account.password_hash):
-        return JsonResponse({"error": "invalid credentials"}, status=401)
-
-    if account.status == AccountStatus.PENDING:
+    if account_status == AccountStatus.PENDING:
         return JsonResponse(
             {"error": "account pending email verification — check your inbox"}, status=403
         )
-    if account.status == AccountStatus.BLOCKED:
+    if account_status == AccountStatus.BLOCKED:
         return JsonResponse({"error": "account blocked"}, status=403)
 
-    token_str = _create_session_token(account)
+    token_str = _create_session_token(account)  # account exists: account_status is not None
     logger.info("login username=%s", username)
     return JsonResponse({"token": token_str})
 
@@ -175,6 +187,8 @@ def register_view(request: HttpRequest) -> JsonResponse:
         if user is None:
             return JsonResponse({"error": "unauthorized"}, status=401)
         data = json.loads(request.body)
+        if data.get("username") != user.username:
+            return JsonResponse({"error": "forbidden"}, status=403)
         registry.upsert(
             data["username"],
             data["node_id"],
@@ -189,6 +203,8 @@ def register_view(request: HttpRequest) -> JsonResponse:
         if user is None:
             return JsonResponse({"error": "unauthorized"}, status=401)
         data = json.loads(request.body)
+        if data.get("username") != user.username:
+            return JsonResponse({"error": "forbidden"}, status=403)
         registry.remove(data["username"], data["node_id"])
         logger.info("deregistered username=%s node_id=%s", data["username"], data["node_id"])
         return JsonResponse({})

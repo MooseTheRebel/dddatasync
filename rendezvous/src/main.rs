@@ -338,11 +338,23 @@ async fn handle_login(
 
     let (hash, status) = {
         let users = state.users.read().await;
-        let account = users.get(&req.username).ok_or_else(err_invalid)?;
-        (account.password_hash.clone(), account.status.clone())
+        if let Some(account) = users.get(&req.username) {
+            (account.password_hash.clone(), Some(account.status.clone()))
+        } else {
+            // Use the dummy hash so verify_password always runs Argon2,
+            // preventing username enumeration via response-time differences.
+            (DUMMY_HASH.clone(), None)
+        }
     };
 
-    if !verify_password(&req.password, &hash) {
+    let password_ok = verify_password(&req.password, &hash);
+
+    let status = match status {
+        Some(s) => s,
+        None => return Err(err_invalid()),
+    };
+
+    if !password_ok {
         return Err(err_invalid());
     }
 
@@ -384,10 +396,14 @@ async fn handle_register(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    authenticate(&headers, &state).await?;
+    let username = authenticate(&headers, &state).await?;
 
     let req: RegisterRequest =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    if req.username != username {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let record = PeerRecord {
         node_id: req.node_id.clone(),
@@ -428,10 +444,14 @@ async fn handle_deregister(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    authenticate(&headers, &state).await?;
+    let username = authenticate(&headers, &state).await?;
 
     let req: DeregisterRequest =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    if req.username != username {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let mut map = state.registry.write().await;
     if let Some(peers) = map.get_mut(&req.username) {
@@ -531,6 +551,14 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, build_router(state)).await?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Dummy hash for constant-time login responses (prevents username enumeration).
+// Computed once at first use; same Argon2 parameters as real user passwords.
+// ---------------------------------------------------------------------------
+
+static DUMMY_HASH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| hash_password("_dummy_").unwrap_or_default());
 
 // ---------------------------------------------------------------------------
 // Hex helper
@@ -766,6 +794,76 @@ mod tests {
     // -----------------------------------------------------------------------
     // Security fixes
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // BOLA: authenticated user cannot act on behalf of a different user
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn register_as_different_user_is_forbidden() {
+        let server = make_server();
+        let token = signup_and_login(&server, "alice_bola").await;
+        // Sign up a second user so "bob_bola" exists in the registry namespace.
+        signup_and_login(&server, "bob_bola").await;
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "username": "bob_bola", "node_id": "n1", "addrs": [], "relay_url": null
+        })).unwrap();
+        server
+            .post("/register")
+            .add_header("Authorization", format!("Bearer {token}"))
+            .bytes(body.into())
+            .content_type("application/json")
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn deregister_as_different_user_is_forbidden() {
+        let server = make_server();
+        let token_alice = signup_and_login(&server, "alice_deregbola").await;
+        let token_bob = signup_and_login(&server, "bob_deregbola").await;
+
+        // Bob registers a peer.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "username": "bob_deregbola", "node_id": "n1", "addrs": [], "relay_url": null
+        })).unwrap();
+        server
+            .post("/register")
+            .add_header("Authorization", format!("Bearer {token_bob}"))
+            .bytes(body.into())
+            .content_type("application/json")
+            .await
+            .assert_status_ok();
+
+        // Alice tries to deregister Bob's peer — must be rejected.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "username": "bob_deregbola", "node_id": "n1"
+        })).unwrap();
+        server
+            .delete("/register")
+            .add_header("Authorization", format!("Bearer {token_alice}"))
+            .bytes(body.into())
+            .content_type("application/json")
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
+    }
+
+    // -----------------------------------------------------------------------
+    // Timing: login for unknown username still runs Argon2
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn login_nonexistent_user_returns_401_not_panic() {
+        // Verifies the constant-time path compiles and runs without panic.
+        // Actual timing guarantees are validated by the LazyLock dummy hash.
+        let server = make_server();
+        server
+            .post("/auth/login")
+            .json(&serde_json::json!({"username": "ghost", "password": "x"}))
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
 
     #[tokio::test]
     async fn blocked_user_token_is_rejected() {
