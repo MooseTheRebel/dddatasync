@@ -154,7 +154,7 @@ fn verify_password(password: &str, hash: &str) -> bool {
 }
 
 fn generate_token() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     hex_encode(&bytes)
