@@ -13,7 +13,7 @@ license = "MIT"
 anyhow = "1.0.102"
 clap = { version = "4", features = ["derive"] }
 argon2 = "0.5"          # 0.6 is still RC; stay on stable
-dirs = "6"              # dirs 6 is a major bump; hold until tested
+dirs = "6"              # dirs 7 is a major bump; hold until tested
 iroh = "=1.0.0-rc.1"
 iroh-blobs = "0.102"
 n0-future = "0.3"
